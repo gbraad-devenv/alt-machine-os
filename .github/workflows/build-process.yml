@@ -1,0 +1,158 @@
+name: build containers - podman-machine-bootc
+run-name: Building containers - podman-machine-bootc
+
+on:
+    schedule:
+      - cron: "0 2 */2 * *"
+    workflow_dispatch:
+  
+env:
+    DISK_TYPE: qcow2
+    ROOTFS: xfs
+    ARCH: amd64
+    BIB_IMAGE: quay.io/centos-bootc/bootc-image-builder:latest
+    BODY: "Podman Machine OS disk images"
+
+jobs:
+  build-containers-podman-machine-bootc:
+    name: build-containers-podman-machine-bootc
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Workaround podman issues in GH actions
+        run: |
+          # see https://github.com/osbuild/bootc-image-builder/issues/446
+          sudo rm -rf /var/lib/containers/storage
+          sudo mkdir -p /etc/containers
+          echo -e "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"" | sudo tee /etc/containers/storage.conf
+  
+      - name: Workarounds for GH runner diskspace
+        run: |
+          sudo mkdir -p /mnt/var/lib/containers
+          sudo mount -o bind /mnt/var/lib/containers /var/lib/containers
+          sudo mkdir /var/lib/containers/storage
+
+
+      - name: Run podman build - podman-machine-bootc
+        run: |
+          podman build -t ghcr.io/gbraad-devenv/fedora/podman-machine-bootc:41 \
+            --build-arg=BASE_IMAGE="ghcr.io/gbraad-dotfiles/fedora-bootc" \
+            --build-arg=BASE_VERSION=41 \
+            -f containers/Containerfile .
+
+      - name: Login to ghcr.io
+        run: |
+          podman login ghcr.io -u ${{ github.actor }} \
+            -p ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image to ghcr.io - podman-machine-bootc
+        run: |
+          podman push ghcr.io/gbraad-devenv/fedora/podman-machine-bootc:41
+
+
+      - name: Create user configuration
+        run: touch config.toml
+
+      - name: Build image - systemd
+        id: build-image-systemd
+        run: |
+          mkdir -p ./output
+          sudo podman pull ${{ env.IMAGE_NAME }}
+          sudo podman run \
+            --rm \
+            -it \
+            --privileged \
+            --pull=newer \
+            --security-opt label=type:unconfined_t \
+            -v ./config.toml:/config.toml:ro \
+            -v ./output:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            ${{ env.BIB_IMAGE }} \
+            --target-arch ${{ env.ARCH }} \
+            --type ${{ env.DISK_TYPE }} \
+            --rootfs ${{ env.ROOTFS }} \
+            --local \
+            ${{ env.IMAGE_NAME }}
+        env:
+          IMAGE_NAME: ghcr.io/gbraad-devenv/fedora/podman-machine-bootc:41
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disk-amd64
+          path: output/qcow2/disk.qcow2
+          retention-days: 7
+
+
+  build-imagecontainer-podman-machine-bootc:
+    name: build-imagecontainer-podman-machine-bootc
+    needs:
+      - build-containers-podman-machine-bootc
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+    container: 
+      image: quay.io/fedora/fedora:41
+      options: --privileged
+
+    steps:
+      - name: Download amd64
+        uses: actions/download-artifact@v4
+        with:
+          name: disk-amd64
+          path: disk-amd64/
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            podman skopeo buildah zstd
+
+      - name: Set release tag
+        id: get-tag
+        run: |
+          echo "TAG=$(date +'%y%m%d')" >> $GITHUB_OUTPUT
+
+      - name: Prepare and compress disk image
+        run: |
+          mv ./disk-amd64/disk.qcow2 ./disk-amd64/podman-machine.x86_64.qemu.qcow2
+          zstd --rm -T0 -14 ./disk-amd64/podman-machine.x86_64.qemu.qcow2
+
+      - name: Wrap disk image in container
+        run: |
+          buildah manifest create podman-machine-os
+          buildah manifest add --artifact --artifact-type="" \
+            --os=linux --arch="x86_64" --annotation "disktype=qemu" \
+            localhost/podman-machine-os \
+            ./disk-amd64/podman-machine.x86_64.qemu.qcow2.zst
+
+      - name: Login to ghcr.io
+        run: |
+          podman login ghcr.io -u ${{ github.actor }} \
+            -p ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push image container to registry
+        run: |
+          podman tag podman-machine-os:latest \
+            ghcr.io/gbraad-devenv/fedora/podman-machine-os:latest
+          podman tag podman-machine-os:latest \
+            ghcr.io/gbraad-devenv/fedora/podman-machine-os:41
+          podman tag podman-machine-os:latest \
+            ghcr.io/gbraad-devenv/fedora/podman-machine-os:${{ steps.get-tag.outputs.TAG }}
+          podman push ghcr.io/gbraad-devenv/fedora/podman-machine-os:latest
+          podman push ghcr.io/gbraad-devenv/fedora/podman-machine-os:41
+          podman push ghcr.io/gbraad-devenv/fedora/podman-machine-os:${{ steps.get-tag.outputs.TAG }}
