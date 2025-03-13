@@ -107,7 +107,7 @@ jobs:
         os:
           - ubuntu-latest
     container: 
-      image: quay.io/fedora/fedora:41
+      image: ghcr.io/gbraad-actions/fedora:stable
       options: --privileged
 
     steps:
@@ -116,11 +116,6 @@ jobs:
         with:
           name: disk-amd64
           path: disk-amd64/
-
-      - name: Install dependencies
-        run: |
-          dnf install -y \
-            podman skopeo buildah zstd
 
       - name: Set release tag
         id: get-tag
